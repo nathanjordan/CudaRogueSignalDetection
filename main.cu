@@ -4,26 +4,114 @@
 #include <unistd.h>
 #include <vector>
 #include <complex>
-#include <fftw3.h>
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <string.h>
 #include <math.h>
 #include <map>
 #include <stdexcept>
+#include <cufft.h>
+#include <helper_functions.h>
+#include <helper_cuda.h>
 
 #define PI 3.14159265359
 #define BLOCK_SIZE 4096
 #define SIGNAL_THRESHOLD 102
+#define MAX_TRANSMISSIONS 200
 
 //172MHz gives us CB
 #define SAMPLE_RATE 172089331.259
+#define BATCH_SIZE 1
 
 #define HzInMHz 1000000
 
 typedef char byte;
+typedef float2 Complex;
 
-typedef double fftw_real;
+__device__ cufftReal* sourceBuffer;
+
+__device__ cufftComplex* resultBuffer;
+
+__device__ cufftReal* scaledResultBuffer;
+
+__device__ bool* activeTransmissions;
+
+__device__ int* transmissionBins;
+
+__device__ cufftReal* transmissionFrequencies;
+
+__device__ cufftReal* transmissionStarts;
+
+__device__ cufftReal* transmissionEnds;
+
+__device__ cufftReal* transmissionStrengths;
+
+__device__ int transmissionCount;
+
+__device__ int timeStep;
+
+void __global__ scaleResult( )
+{
+
+	int idx = threadIdx.x;
+
+	if( idx < BLOCK_SIZE )
+	{
+
+		scaledResultBuffer[ idx ] = sqrt( resultBuffer[ idx ][ 0 ] * resultBuffer[ idx ][ 0 ] * +
+										  resultBuffer[ idx ][ 1 ] * resultBuffer[ idx ][ 1 ]      );
+
+		scaledResultBuffer[ idx ] = 20 * log10( scaledResultBuffer[ idx ] );
+
+	}
+
+}
+
+void __global__ findTransmissions( )
+{
+
+	int idx = threadIdx.x;
+
+	if( idx < BLOCK_SIZE )
+	{
+
+		if( scaledResultBuffer[ idx ] > SIGNAL_THRESHOLD && activeTransmissions[ idx ] == false )
+		{
+
+
+
+		}
+
+	}
+
+}
+
+void __device__ createTransmission( int idx )
+{
+
+
+
+}
+
+cufftComplex *deviceResult;
+
+cufftReal *deviceSource;
+
+cufftReal *deviceScaledResult;
+
+int* deviceBins;
+
+cufftReal *deviceFrequencies;
+
+cufftReal *deviceStarts;
+
+cufftReal *deviceEnds;
+
+cufftReal *deviceStrengths;
+
+bool* deviceActiveTransmissions;
+
+int* deviceCount;
 
 void outputFFTData( std::string filename, fftw_real* data , unsigned int size );
 
@@ -72,15 +160,12 @@ int main( int argc , char** argv )
 
 	}
 
-
-	fftw_real* original = new fftw_real[ filesize ];
-
-	fftw_complex* result = new fftw_complex[ filesize ];
+	cufftReal* original = new cufftReal[ filesize ];
 
 	for( unsigned int i = 0 ; i < filesize ; i++ )
 	{
 	
-		original[i] = (double) (byte) f.get();
+		original[i] = (cufftReal) (byte) f.get();
 
 	}
 
@@ -88,33 +173,73 @@ int main( int argc , char** argv )
 
 	int fft_size = BLOCK_SIZE;
 
-	//create a new input for the windowing function
-	fftw_real* currentWindow = new fftw_real[ fft_size ];
-	
-	fftw_real* resultScaled = new fftw_real[ fft_size ];
+	int max_transmissions = MAX_TRANSMISSIONS;
 
-	for( unsigned int j = 0 ; j < filesize * 0.125 - BLOCK_SIZE  ; j += BLOCK_SIZE )
+	//get the address for the device's source buffer
+	cudaGetSymbolAddress( (void**) &deviceSource , sourceBuffer );
+
+	//get the address for the device's result buffer
+	cudaGetSymbolAddress( (void**) &deviceResult , resultBuffer );
+
+	//get the address for the device's result buffer
+	cudaGetSymbolAddress( (void**) &deviceScaledResult , scaledResultBuffer );
+
+	//get the address for the device's result buffer
+	cudaGetSymbolAddress( (void**) &deviceBins , transmissionBins );
+
+	//get the address for the device's result buffer
+	cudaGetSymbolAddress( (void**) &deviceFrequencies , transmissionFrequencies );
+
+	//get the address for the device's result buffer
+	cudaGetSymbolAddress( (void**) &deviceStarts , transmissionStarts );
+
+	//get the address for the device's result buffer
+	cudaGetSymbolAddress( (void**) &deviceEnds , transmissionEnds );
+
+	//get the address for the device's result buffer
+	cudaGetSymbolAddress( (void**) &deviceStrengths , transmissionStrengths );
+
+	//get the address for the device's result buffer
+	cudaGetSymbolAddress( (void**) &deviceCount , transmissionCount );
+
+	//get the address for the device's result buffer
+	cudaGetSymbolAddress( (void**) &deviceActiveTransmissions , activeTransmissions );
+
+	cudaMalloc( &deviceSource , filesize * sizeof(cufftReal) );
+
+	cudaMalloc( &deviceResult ,  fft_size * sizeof(cufftComplex) );
+
+	cudaMalloc( &deviceScaledResult ,  fft_size * sizeof(cufftReal) );
+
+	cudaMalloc( &deviceBins , max_transmissions * sizeof(int) );
+
+	cudaMalloc( &deviceFrequencies ,  max_transmissions * sizeof(cufftReal) );
+
+	cudaMalloc( &deviceStarts , max_transmissions * sizeof(cufftReal) );
+
+	cudaMalloc( &deviceEnds ,  max_transmissions * sizeof(cufftReal) );
+
+	cudaMalloc( &deviceStrengths ,  max_transmissions * sizeof(cufftReal) );
+
+	cudaMalloc( &deviceActiveTransmissions ,  fft_size * sizeof(bool) );
+
+	// TODO: This giant memcpy will become a pipelined streaming thingy
+	cudaMemcpy( deviceSource , original , filesize * 0.25 * sizeof( cufftReal ) , cudaMemcpyHostToDevice );
+
+	for( unsigned int j = 0 ; j < filesize * 0.25 - fft_size  ; j += fft_size )
 	{
 		
-		memcpy( currentWindow , original + j * sizeof(fftw_real) , BLOCK_SIZE * sizeof(fftw_real) );
-		
 		//prepare the FFT
-		fftw_plan p = fftw_plan_dft_r2c_1d( fft_size , currentWindow , result , FFTW_ESTIMATE );
+		cufftHandle p;
+
+		cufftPlan1d( &p , BLOCK_SIZE , CUFFT_R2C , BATCH_SIZE );
 
 		//Run the FFT
-		fftw_execute( p );
+		cufftExecR2C( p , deviceSource, deviceResult );
 
 		//calculate amplitude of first N/2 bins (Nyquist Limit?)
-		for( unsigned int i = 0 ; i < BLOCK_SIZE / 2 ; i++ )
+		for( unsigned int i = 0 ; i < fft_size / 2 ; i++ )
 		{
-
-			//get magnitude using complex conjugate
-			resultScaled[ i ] = sqrt( result[ i ][ 0 ] * result[ i ][ 0 ] + result[ i ][ 1 ] * result[ i ][ 1 ] );
-
-			//put into decibels
-			resultScaled[ i ] = 20 * log10( resultScaled[ i ] );
-
-			//difference[ i ] = 20.0f * log10( resultScaled[ i ] - resultScaledOld[ i ] );
 
 			bool activeTransmission = true;
 
