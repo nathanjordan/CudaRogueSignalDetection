@@ -10,13 +10,31 @@
 #include <math.h>
 #include <map>
 #include <stdexcept>
+#include <cuda.h>
 #include <cufft.h>
-#include <helper_functions.h>
-#include <helper_cuda.h>
+
+//#include <helper_functions.h>
+//#include <helper_cuda.h>
+
+#define gpuErrchk(ans) { gpuAssert((ans), __FILE__, __LINE__); }
+inline void gpuAssert(cudaError_t code, char *file, int line, bool abort=true)
+{
+   if (code != cudaSuccess) 
+   {
+      fprintf(stderr,"CUDA_ERROR:\ncode:%s\nfile: %s\nline:%d\n", cudaGetErrorString(code), file, line);
+      if (abort) exit(code);
+   }
+}
+
+///////////////////////////////////////////////////////////////////////////////////////////////
+////
+////    Constants & Typedefs
+////
+///////////////////////////////////////////////////////////////////////////////////////////////
 
 #define PI 3.14159265359
 #define BLOCK_SIZE 4096
-#define SIGNAL_THRESHOLD 102
+#define SIGNAL_THRESHOLD 200
 #define MAX_TRANSMISSIONS 200
 
 //172MHz gives us CB
@@ -28,57 +46,63 @@
 typedef char byte;
 typedef float2 Complex;
 
-__device__ cufftReal* sourceBuffer;
-
-__device__ cufftComplex* resultBuffer;
-
-__device__ cufftReal* scaledResultBuffer;
-
-__device__ bool* activeTransmissions;
-
-__device__ int* transmissionBins;
-
-__device__ cufftReal* transmissionFrequencies;
-
-__device__ cufftReal* transmissionStarts;
-
-__device__ cufftReal* transmissionEnds;
-
-__device__ cufftReal* transmissionStrengths;
+///////////////////////////////////////////////////////////////////////////////////////////////
+////
+////    Device Variables
+////
+///////////////////////////////////////////////////////////////////////////////////////////////
 
 __device__ int transmissionCount;
 
 __device__ int timeStep;
 
-void __global__ scaleResult( )
+///////////////////////////////////////////////////////////////////////////////////////////////
+////
+////    Kernels
+////
+///////////////////////////////////////////////////////////////////////////////////////////////
+
+void __device__ createTransmission( int idx ,
+		int* transmissionBins,
+		cufftReal* scaledResultBuffer,
+		cufftReal* transmissionFrequencies,
+		cufftReal* transmissionStarts,
+		cufftReal* transmissionStrengths,
+		bool* activeTransmissions
+	)
 {
 
-	int idx = threadIdx.x;
+	transmissionBins[ transmissionCount - 1 ] = idx;
 
-	if( idx < BLOCK_SIZE )
-	{
+	//frequency in MHz
+	transmissionFrequencies[ transmissionCount - 1 ] = idx * SAMPLE_RATE / BLOCK_SIZE / HzInMHz;
 
-		scaledResultBuffer[ idx ] = sqrt( resultBuffer[ idx ][ 0 ] * resultBuffer[ idx ][ 0 ] * +
-										  resultBuffer[ idx ][ 1 ] * resultBuffer[ idx ][ 1 ]      );
+	transmissionStarts[ transmissionCount - 1 ] = timeStep / SAMPLE_RATE;
 
-		scaledResultBuffer[ idx ] = 20 * log10( scaledResultBuffer[ idx ] );
+	transmissionStrengths[ transmissionCount - 1 ] = scaledResultBuffer[ idx ];
 
-	}
+	activeTransmissions[ idx ] = true;
 
 }
 
-void __global__ findTransmissions( )
+void __device__ finishTransmission( int idx,
+		int* transmissionBins,
+		cufftReal* transmissionEnds,
+		bool* activeTransmissions
+	)
 {
 
-	int idx = threadIdx.x;
-
-	if( idx < BLOCK_SIZE )
+	for( int i = transmissionCount - 1 ; i >= 0 ; i-- )
 	{
 
-		if( scaledResultBuffer[ idx ] > SIGNAL_THRESHOLD && activeTransmissions[ idx ] == false )
+		if( transmissionBins[ i ] == idx )
 		{
 
+			transmissionEnds[ i ] = timeStep / SAMPLE_RATE;
 
+			activeTransmissions[ idx ] = false;
+
+			return;
 
 		}
 
@@ -86,51 +110,123 @@ void __global__ findTransmissions( )
 
 }
 
-void __device__ createTransmission( int idx )
+void __global__ scaleResult( cufftReal* scaledResultBuffer , cufftComplex* resultBuffer )
 {
 
+	int idx = blockIdx.x * blockDim.x + threadIdx.x;
 
+	if( idx < BLOCK_SIZE )
+	{
+
+		scaledResultBuffer[ idx ] = sqrt( resultBuffer[ idx ].x * resultBuffer[ idx ].x * +
+										  resultBuffer[ idx ].y * resultBuffer[ idx ].y      );
+
+		scaledResultBuffer[ idx ] = 20 * log10( scaledResultBuffer[ idx ] );
+
+	}
 
 }
 
-cufftComplex *deviceResult;
-
-cufftReal *deviceSource;
-
-cufftReal *deviceScaledResult;
-
-int* deviceBins;
-
-cufftReal *deviceFrequencies;
-
-cufftReal *deviceStarts;
-
-cufftReal *deviceEnds;
-
-cufftReal *deviceStrengths;
-
-bool* deviceActiveTransmissions;
-
-int* deviceCount;
-
-void outputFFTData( std::string filename, fftw_real* data , unsigned int size );
-
-class transmission
+void __global__ initTransmissionArray( bool* activeTransmissions )
 {
 
-public:
+	int idx = blockIdx.x * blockDim.x + threadIdx.x;
 
-	int bin;
+	transmissionCount = 0;
 
-	float frequency;
+	if( idx < BLOCK_SIZE )
 
-	float timeStart;
+		activeTransmissions[ idx ] = false;
 
-	float timeEnd;
+}
 
-	float peakStrength;
+void __global__ findTransmissions(
+		cufftReal* scaledResultBuffer ,
+		int* deviceBins,
+		cufftReal *deviceFrequencies,
+		cufftReal *deviceStarts,
+		cufftReal *deviceEnds,
+		cufftReal *deviceStrengths,
+		bool* activeTransmissions
+	)
+{
 
-};
+	int idx = blockIdx.x * blockDim.x + threadIdx.x;
+
+	if( idx < BLOCK_SIZE && idx != 0 )
+	{
+
+		if( scaledResultBuffer[ idx ] > SIGNAL_THRESHOLD && activeTransmissions[ idx ] == false )
+		{
+
+			atomicAdd( &transmissionCount , 1 );
+
+			createTransmission( idx , deviceBins , scaledResultBuffer , deviceFrequencies , deviceStarts , deviceStrengths, activeTransmissions );
+
+		}
+
+		if( scaledResultBuffer[ idx ] < SIGNAL_THRESHOLD && activeTransmissions[ idx ] == true )
+		{
+
+			finishTransmission( idx , deviceBins , deviceEnds , activeTransmissions );
+
+		}
+
+	}
+
+	//timeStep += BLOCK_SIZE;
+
+	atomicAdd( &timeStep , 1 );
+
+}
+
+///////////////////////////////////////////////////////////////////////////////////////////////
+////
+////    Device Pointers
+////
+///////////////////////////////////////////////////////////////////////////////////////////////
+
+cufftComplex *deviceResult = 0;
+
+cufftReal *deviceSource = 0;
+
+cufftReal *deviceScaledResult = 0;
+
+int* deviceBins = 0;
+
+cufftReal *deviceFrequencies = 0;
+
+cufftReal *deviceStarts = 0;
+
+cufftReal *deviceEnds = 0;
+
+cufftReal *deviceStrengths = 0;
+
+bool* deviceActiveTransmissions = 0;
+
+int* deviceCount = 0;
+
+///////////////////////////////////////////////////////////////////////////////////////////////
+////
+////    Host Variables
+////
+///////////////////////////////////////////////////////////////////////////////////////////////
+
+int* hostBins;
+
+cufftReal *hostFrequencies;
+
+cufftReal *hostStarts;
+
+cufftReal *hostEnds;
+
+cufftReal *hostStrengths;
+
+///////////////////////////////////////////////////////////////////////////////////////////////
+////
+////    Functions
+////
+///////////////////////////////////////////////////////////////////////////////////////////////
 
 int main( int argc , char** argv )
 {
@@ -138,10 +234,6 @@ int main( int argc , char** argv )
 	std::string filename = std::string( argv[1] );
 
 	std::ifstream f;
-
-	std::map< int , transmission > currentSpikes;
-
-	std::vector< transmission > historicalSpikes;
 
 	struct stat filestatus;
 
@@ -175,156 +267,118 @@ int main( int argc , char** argv )
 
 	int max_transmissions = MAX_TRANSMISSIONS;
 
-	//get the address for the device's source buffer
-	cudaGetSymbolAddress( (void**) &deviceSource , sourceBuffer );
-
-	//get the address for the device's result buffer
-	cudaGetSymbolAddress( (void**) &deviceResult , resultBuffer );
-
-	//get the address for the device's result buffer
-	cudaGetSymbolAddress( (void**) &deviceScaledResult , scaledResultBuffer );
-
-	//get the address for the device's result buffer
-	cudaGetSymbolAddress( (void**) &deviceBins , transmissionBins );
-
-	//get the address for the device's result buffer
-	cudaGetSymbolAddress( (void**) &deviceFrequencies , transmissionFrequencies );
-
-	//get the address for the device's result buffer
-	cudaGetSymbolAddress( (void**) &deviceStarts , transmissionStarts );
-
-	//get the address for the device's result buffer
-	cudaGetSymbolAddress( (void**) &deviceEnds , transmissionEnds );
-
-	//get the address for the device's result buffer
-	cudaGetSymbolAddress( (void**) &deviceStrengths , transmissionStrengths );
-
-	//get the address for the device's result buffer
 	cudaGetSymbolAddress( (void**) &deviceCount , transmissionCount );
 
-	//get the address for the device's result buffer
-	cudaGetSymbolAddress( (void**) &deviceActiveTransmissions , activeTransmissions );
+	gpuErrchk( cudaMalloc( &deviceSource , filesize * sizeof(cufftReal) ));
 
-	cudaMalloc( &deviceSource , filesize * sizeof(cufftReal) );
+	gpuErrchk( cudaMalloc( &deviceResult ,  fft_size * sizeof(cufftComplex) ));
 
-	cudaMalloc( &deviceResult ,  fft_size * sizeof(cufftComplex) );
+	gpuErrchk( cudaMalloc( &deviceScaledResult ,  fft_size * sizeof(cufftReal) ));
 
-	cudaMalloc( &deviceScaledResult ,  fft_size * sizeof(cufftReal) );
+	gpuErrchk( cudaMalloc( &deviceBins , max_transmissions * sizeof(int) ));
 
-	cudaMalloc( &deviceBins , max_transmissions * sizeof(int) );
+	gpuErrchk( cudaMalloc( &deviceFrequencies ,  max_transmissions * sizeof(cufftReal) ));
 
-	cudaMalloc( &deviceFrequencies ,  max_transmissions * sizeof(cufftReal) );
+	gpuErrchk( cudaMalloc( &deviceStarts , max_transmissions * sizeof(cufftReal) ));
 
-	cudaMalloc( &deviceStarts , max_transmissions * sizeof(cufftReal) );
+	gpuErrchk( cudaMalloc( &deviceEnds ,  max_transmissions * sizeof(cufftReal) ));
 
-	cudaMalloc( &deviceEnds ,  max_transmissions * sizeof(cufftReal) );
+	gpuErrchk( cudaMalloc( &deviceStrengths ,  max_transmissions * sizeof(cufftReal) ));
 
-	cudaMalloc( &deviceStrengths ,  max_transmissions * sizeof(cufftReal) );
-
-	cudaMalloc( &deviceActiveTransmissions ,  fft_size * sizeof(bool) );
+	gpuErrchk( cudaMalloc( &deviceActiveTransmissions ,  fft_size * sizeof(bool) ));
 
 	// TODO: This giant memcpy will become a pipelined streaming thingy
-	cudaMemcpy( deviceSource , original , filesize * 0.25 * sizeof( cufftReal ) , cudaMemcpyHostToDevice );
+	gpuErrchk( cudaMemcpy( deviceSource , original , filesize * sizeof( cufftReal ) , cudaMemcpyHostToDevice ));
+
+	initTransmissionArray<<< 64 , 32 >>>( deviceActiveTransmissions );
+
+	//prepare the FFT
+	cufftHandle p;
+
+	cufftResult_t fft_result;
+
+	fft_result = cufftPlan1d( &p , BLOCK_SIZE , CUFFT_R2C , BATCH_SIZE );
+
+	if( fft_result != CUFFT_SUCCESS )
+
+		exit(1);
+
 
 	for( unsigned int j = 0 ; j < filesize * 0.25 - fft_size  ; j += fft_size )
 	{
 		
-		//prepare the FFT
-		cufftHandle p;
+		fft_result = cufftExecR2C( p , deviceSource + j * sizeof( cufftReal ) , deviceResult );
+		
+		if( fft_result != CUFFT_SUCCESS )
 
-		cufftPlan1d( &p , BLOCK_SIZE , CUFFT_R2C , BATCH_SIZE );
+			exit(2);
 
-		//Run the FFT
-		cufftExecR2C( p , deviceSource, deviceResult );
+		// num blocks * num threads = fftsize / 2 ... nyquist limit
+		scaleResult<<< 64 , 32 >>>( deviceScaledResult , deviceResult );
 
-		//calculate amplitude of first N/2 bins (Nyquist Limit?)
-		for( unsigned int i = 0 ; i < fft_size / 2 ; i++ )
-		{
+		gpuErrchk( cudaPeekAtLastError() );
 
-			bool activeTransmission = true;
+		findTransmissions<<< 64 , 32 >>>(
+				deviceScaledResult,
+				deviceBins,
+				deviceFrequencies,
+				deviceStarts,
+				deviceEnds,
+				deviceStrengths,
+				deviceActiveTransmissions
+			);
 
-			try
-			{
-
-				currentSpikes.at( i );
-
-			}
-			catch( std::out_of_range& e )
-			{
-
-				activeTransmission = false;
-
-			}
-
-			if( resultScaled[ i ] > SIGNAL_THRESHOLD && activeTransmission == false )
-			{
-				
-				transmission trans;
-
-				trans.bin = i;
-
-				//frequency in MHz
-				trans.frequency = i * SAMPLE_RATE / fft_size / HzInMHz;
-
-				trans.timeStart = j / SAMPLE_RATE;
-
-				trans.peakStrength = resultScaled[ i ];
-
-				currentSpikes.insert( std::pair< int, transmission >( i , trans ) );
-
-				//debug
-				outputFFTData( "spikeWindow.txt" , resultScaled , fft_size );
-
-			}
-
-			if( resultScaled[ i ] < SIGNAL_THRESHOLD && activeTransmission == true )
-			{
-
-				transmission t = currentSpikes.at( i );
-
-				t.timeEnd = j / SAMPLE_RATE;
-
-				historicalSpikes.push_back( t );
-
-				currentSpikes.erase( i );
-
-			}
-		}
+		gpuErrchk( cudaPeekAtLastError() );
 
 	}
+
+	//Copy all that crap back
+	int* hostCount = new int;
+
+	hostBins = new int[ MAX_TRANSMISSIONS ];
+
+	hostFrequencies = new cufftReal[ MAX_TRANSMISSIONS ];
+
+	hostStarts = new cufftReal[ MAX_TRANSMISSIONS ];
+
+	hostEnds = new cufftReal[ MAX_TRANSMISSIONS ];
+
+	hostStrengths = new cufftReal[ MAX_TRANSMISSIONS ];
+
+	std::cout << "LOLZ" << std::endl;
+
+	gpuErrchk( cudaMemcpy( hostBins , deviceBins , MAX_TRANSMISSIONS * sizeof( int ) , cudaMemcpyDeviceToHost ));
+
+	gpuErrchk( cudaMemcpy( hostFrequencies , deviceFrequencies , MAX_TRANSMISSIONS * sizeof( cufftReal ) , cudaMemcpyDeviceToHost ));
+
+	gpuErrchk( cudaMemcpy( hostStarts , deviceStarts , MAX_TRANSMISSIONS * sizeof( cufftReal ) , cudaMemcpyDeviceToHost ));
+
+	gpuErrchk( cudaMemcpy( hostEnds , deviceEnds , MAX_TRANSMISSIONS * sizeof( cufftReal ) , cudaMemcpyDeviceToHost ));
+
+	gpuErrchk( cudaMemcpy( hostStrengths , deviceStrengths , MAX_TRANSMISSIONS * sizeof( cufftReal ) , cudaMemcpyDeviceToHost ));
+
+	gpuErrchk( cudaMemcpy( hostCount , deviceCount , sizeof( int ) , cudaMemcpyDeviceToHost ) );
+
+	std::cout << *hostCount << std::endl;
 
 	std::ofstream fo;
 
 	fo.open( "spikes.txt" );
 
-	for( unsigned int i = 0 ; i < historicalSpikes.size() ; i++ )
+	for( unsigned int i = 0 ; i < *hostCount ; i++ )
 	{
 
-		fo << "====TRANSMISSION====" << "\n";
+		fo << "==== TRANSMISSION ====" << "\n";
 
 		//In MHz
-		fo << "Frequency       : " << historicalSpikes[ i ].frequency << " MHz\n";
-		fo << "Signal strength : " << historicalSpikes[ i ].peakStrength << " dB\n";
-		fo << "Time start      : " << historicalSpikes[ i ].timeStart << " s\n";
-		fo << "Time end        : " << historicalSpikes[ i ].timeEnd << " s\n";
+		fo << "Bin             : " << hostBins[ i ] << " \n";
+		fo << "Frequency       : " << hostFrequencies[ i ] << " MHz\n";
+		fo << "Signal strength : " << hostStrengths[ i ] << " dB\n";
+		fo << "Time start      : " << hostStarts[ i ] << " s\n";
+		fo << "Time end        : " << hostEnds[ i ] << " s\n";
 
 	}
 
 	return 0;
-
-}
-
-void outputFFTData( std::string filename, fftw_real* data , unsigned int size )
-{
-	std::ofstream fo;
-
-	fo.open( filename.c_str() );
-
-	for( unsigned int i = 0 ; i < size * 0.5 ; i++ )
-	{
-
-		fo << data[ i ] << std::endl;
-
-	}
 
 }
