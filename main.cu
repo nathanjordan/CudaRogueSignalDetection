@@ -290,7 +290,7 @@ int main( int argc , char** argv )
 	// TODO: This giant memcpy will become a pipelined streaming thingy
 	gpuErrchk( cudaMemcpy( deviceSource , original , filesize * sizeof( cufftReal ) , cudaMemcpyHostToDevice ));
 
-	initTransmissionArray<<< 64 , 32 >>>( deviceActiveTransmissions );
+	initTransmissionArray<<< 32 , 64 >>>( deviceActiveTransmissions );
 
 	//prepare the FFT
 	cufftHandle p;
@@ -314,11 +314,11 @@ int main( int argc , char** argv )
 			exit(2);
 
 		// num blocks * num threads = fftsize / 2 ... nyquist limit
-		scaleResult<<< 64 , 32 >>>( deviceScaledResult , deviceResult );
+		scaleResult<<< 32 , 64 >>>( deviceScaledResult , deviceResult );
 
 		gpuErrchk( cudaPeekAtLastError() );
 
-		findTransmissions<<< 64 , 32 >>>(
+		findTransmissions<<< 32 , 64 >>>(
 				deviceScaledResult,
 				deviceBins,
 				deviceFrequencies,
