@@ -40,6 +40,8 @@ inline void gpuAssert(cudaError_t code, char *file, int line, bool abort=true)
 //172MHz gives us CB
 #define SAMPLE_RATE 172089331.259
 #define BATCH_SIZE 1
+#define NUM_STREAMS 2
+#define BLOCKS_PER_STREAM 16
 
 #define HzInMHz 1000000
 
@@ -252,7 +254,15 @@ int main( int argc , char** argv )
 
 	}
 
-	cufftReal* original = new cufftReal[ filesize ];
+	cufftReal* original = 0;
+
+	//std::cout << "1" << std::endl;
+
+	//cudaSetDevice( 1 );
+
+	gpuErrchk( cudaMallocHost( (void**) &original , filesize * sizeof( cufftReal ) ) );
+
+	//std::cout << "2" << std::endl;
 
 	for( unsigned int i = 0 ; i < filesize ; i++ )
 	{
@@ -263,74 +273,114 @@ int main( int argc , char** argv )
 
 	f.close();
 
-	int fft_size = BLOCK_SIZE;
-
-	int max_transmissions = MAX_TRANSMISSIONS;
-
 	cudaGetSymbolAddress( (void**) &deviceCount , transmissionCount );
 
-	gpuErrchk( cudaMalloc( &deviceSource , filesize * sizeof(cufftReal) ));
+	gpuErrchk( cudaMalloc( &deviceSource , NUM_STREAMS * BLOCKS_PER_STREAM * BLOCK_SIZE * sizeof(cufftReal) ));
 
-	gpuErrchk( cudaMalloc( &deviceResult ,  fft_size * sizeof(cufftComplex) ));
+	gpuErrchk( cudaMalloc( &deviceResult ,  NUM_STREAMS * BLOCKS_PER_STREAM * BLOCK_SIZE * sizeof(cufftComplex) ));
 
-	gpuErrchk( cudaMalloc( &deviceScaledResult ,  fft_size * sizeof(cufftReal) ));
+	gpuErrchk( cudaMalloc( &deviceScaledResult ,  NUM_STREAMS * BLOCKS_PER_STREAM * BLOCK_SIZE * sizeof(cufftReal) ));
 
-	gpuErrchk( cudaMalloc( &deviceBins , max_transmissions * sizeof(int) ));
+	gpuErrchk( cudaMalloc( &deviceBins , MAX_TRANSMISSIONS * sizeof(int) ));
 
-	gpuErrchk( cudaMalloc( &deviceFrequencies ,  max_transmissions * sizeof(cufftReal) ));
+	gpuErrchk( cudaMalloc( &deviceFrequencies ,  MAX_TRANSMISSIONS * sizeof(cufftReal) ));
 
-	gpuErrchk( cudaMalloc( &deviceStarts , max_transmissions * sizeof(cufftReal) ));
+	gpuErrchk( cudaMalloc( &deviceStarts , MAX_TRANSMISSIONS * sizeof(cufftReal) ));
 
-	gpuErrchk( cudaMalloc( &deviceEnds ,  max_transmissions * sizeof(cufftReal) ));
+	gpuErrchk( cudaMalloc( &deviceEnds ,  MAX_TRANSMISSIONS * sizeof(cufftReal) ));
 
-	gpuErrchk( cudaMalloc( &deviceStrengths ,  max_transmissions * sizeof(cufftReal) ));
+	gpuErrchk( cudaMalloc( &deviceStrengths ,  MAX_TRANSMISSIONS * sizeof(cufftReal) ));
 
-	gpuErrchk( cudaMalloc( &deviceActiveTransmissions ,  fft_size * sizeof(bool) ));
+	gpuErrchk( cudaMalloc( &deviceActiveTransmissions ,  NUM_STREAMS * BLOCKS_PER_STREAM * BLOCK_SIZE * sizeof(bool) ));
 
-	// TODO: This giant memcpy will become a pipelined streaming thingy
-	gpuErrchk( cudaMemcpy( deviceSource , original , filesize * sizeof( cufftReal ) , cudaMemcpyHostToDevice ));
+	//std::cout << "3" << std::endl;
 
 	initTransmissionArray<<< 64 , 32 >>>( deviceActiveTransmissions );
 
+	//std::cout << "4" << std::endl;
+
+	cudaStream_t streams[ NUM_STREAMS ];
+
+	for( int i = 0 ; i < NUM_STREAMS ; i++ )
+	{
+
+		gpuErrchk( cudaStreamCreate( &streams[ i ] ) );
+
+	}
+
+	//std::cout << "5" << std::endl;
+
 	//prepare the FFT
-	cufftHandle p;
+	cufftHandle plans[ NUM_STREAMS ];
 
 	cufftResult_t fft_result;
 
-	fft_result = cufftPlan1d( &p , BLOCK_SIZE , CUFFT_R2C , BATCH_SIZE );
-
-	if( fft_result != CUFFT_SUCCESS )
-
-		exit(1);
-
-
-	for( unsigned int j = 0 ; j < filesize * 0.25 - fft_size  ; j += fft_size )
+	for( int i = 0 ; i < NUM_STREAMS ; i++ )
 	{
-		
-		fft_result = cufftExecR2C( p , deviceSource + j * sizeof( cufftReal ) , deviceResult );
-		
+
+		fft_result = cufftPlan1d( &plans[i] , BLOCK_SIZE , CUFFT_R2C , BATCH_SIZE );
+
 		if( fft_result != CUFFT_SUCCESS )
 
-			exit(2);
+			exit(1);
 
-		// num blocks * num threads = fftsize / 2 ... nyquist limit
-		scaleResult<<< 64 , 32 >>>( deviceScaledResult , deviceResult );
+		fft_result = cufftSetStream( plans[i] , streams[i] );
 
-		gpuErrchk( cudaPeekAtLastError() );
+		if( fft_result != CUFFT_SUCCESS )
 
-		findTransmissions<<< 64 , 32 >>>(
-				deviceScaledResult,
-				deviceBins,
-				deviceFrequencies,
-				deviceStarts,
-				deviceEnds,
-				deviceStrengths,
-				deviceActiveTransmissions
-			);
-
-		gpuErrchk( cudaPeekAtLastError() );
+			exit(1);
 
 	}
+
+	//std::cout << "6" << std::endl;
+
+	for( unsigned int j = 0 ; j < filesize * 0.25 - BLOCK_SIZE * NUM_STREAMS  ; j += BLOCK_SIZE * NUM_STREAMS * BLOCKS_PER_STREAM )
+	{
+		int iteration_offset = j * sizeof( cufftReal );
+		
+		for( int k = 0 ; k < NUM_STREAMS ; k++ )
+		{
+
+			int stream_offset = k * BLOCK_SIZE * BLOCKS_PER_STREAM;
+
+			cudaMemcpyAsync( deviceSource + stream_offset  , original + iteration_offset + stream_offset , BLOCK_SIZE * BLOCKS_PER_STREAM , cudaMemcpyHostToDevice , streams[ k ] );
+
+			for( int l = 0 ; l < BLOCKS_PER_STREAM ; l++ )
+			{
+
+				int block_offset = l * BLOCK_SIZE;
+
+				fft_result = cufftExecR2C( plans[k] , deviceSource + stream_offset + block_offset , deviceResult + stream_offset + block_offset );
+
+				if( fft_result != CUFFT_SUCCESS )
+
+					exit(2);
+
+				// num blocks * num threads = fftsize / 2 ... nyquist limit
+				scaleResult<<< 64 , 32 , 0 , streams[ k ] >>>( deviceScaledResult + stream_offset + block_offset , deviceResult + stream_offset + block_offset );
+
+				gpuErrchk( cudaPeekAtLastError() );
+
+				findTransmissions<<< 64 , 32 , 0 , streams[ k ] >>>(
+						deviceScaledResult + stream_offset + block_offset,
+						deviceBins,
+						deviceFrequencies,
+						deviceStarts,
+						deviceEnds,
+						deviceStrengths,
+						deviceActiveTransmissions
+					);
+
+				//std::cout << "11" << std::endl;
+
+				gpuErrchk( cudaPeekAtLastError() );
+
+			}
+		}
+
+	}
+
+	//std::cout << "12" << std::endl;
 
 	//Copy all that crap back
 	int* hostCount = new int;
@@ -345,7 +395,7 @@ int main( int argc , char** argv )
 
 	hostStrengths = new cufftReal[ MAX_TRANSMISSIONS ];
 
-	std::cout << "LOLZ" << std::endl;
+	//std::cout << "13" << std::endl;
 
 	gpuErrchk( cudaMemcpy( hostBins , deviceBins , MAX_TRANSMISSIONS * sizeof( int ) , cudaMemcpyDeviceToHost ));
 
@@ -358,6 +408,8 @@ int main( int argc , char** argv )
 	gpuErrchk( cudaMemcpy( hostStrengths , deviceStrengths , MAX_TRANSMISSIONS * sizeof( cufftReal ) , cudaMemcpyDeviceToHost ));
 
 	gpuErrchk( cudaMemcpy( hostCount , deviceCount , sizeof( int ) , cudaMemcpyDeviceToHost ) );
+
+	//std::cout << "14" << std::endl;
 
 	std::cout << *hostCount << std::endl;
 
