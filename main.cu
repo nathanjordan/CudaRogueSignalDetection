@@ -12,9 +12,11 @@
 #include <stdexcept>
 #include <cuda.h>
 #include <cufft.h>
+//#include <thread>
+//#include <future>
 
-//#include <helper_functions.h>
-//#include <helper_cuda.h>
+
+#include <boost/thread.hpp>
 
 #define gpuErrchk(ans) { gpuAssert((ans), __FILE__, __LINE__); }
 inline void gpuAssert(cudaError_t code, char *file, int line, bool abort=true)
@@ -40,7 +42,7 @@ inline void gpuAssert(cudaError_t code, char *file, int line, bool abort=true)
 //172MHz gives us CB
 #define SAMPLE_RATE 172089331.259
 #define BATCH_SIZE 1
-#define NUM_STREAMS 2
+#define NUM_STREAMS 4
 #define BLOCKS_PER_STREAM 16
 
 #define HzInMHz 1000000
@@ -117,13 +119,20 @@ void __global__ scaleResult( cufftReal* scaledResultBuffer , cufftComplex* resul
 
 	int idx = blockIdx.x * blockDim.x + threadIdx.x;
 
-	if( idx < BLOCK_SIZE )
+	while( idx < BLOCK_SIZE * BLOCKS_PER_STREAM )
 	{
 
-		scaledResultBuffer[ idx ] = sqrt( resultBuffer[ idx ].x * resultBuffer[ idx ].x * +
-										  resultBuffer[ idx ].y * resultBuffer[ idx ].y      );
+		float real = resultBuffer[ idx ].x * resultBuffer[ idx ].x;
 
-		scaledResultBuffer[ idx ] = 20 * log10( scaledResultBuffer[ idx ] );
+		float complex = resultBuffer[ idx ].y * resultBuffer[ idx ].y;
+
+		float modulus = sqrtf( real + complex );
+
+		//scaledResultBuffer[ idx ] = modulus;
+
+		scaledResultBuffer[ idx ] = 20.0f * log10f( modulus );
+
+		idx += gridDim.x * blockDim.x;
 
 	}
 
@@ -230,6 +239,17 @@ cufftReal *hostStrengths;
 ////
 ///////////////////////////////////////////////////////////////////////////////////////////////
 
+void workerThread( cufftHandle plans[] , int streamIndex , cufftReal* deviceSource , cufftComplex* deviceResult, int stream_offset , int block_offset )
+{
+
+	cufftResult_t fft_result = cufftExecR2C( plans[streamIndex] , deviceSource + stream_offset + block_offset , deviceResult + stream_offset + block_offset );
+
+	/*if( fft_result != CUFFT_SUCCESS )
+
+				exit(1);
+*/
+}
+
 int main( int argc , char** argv )
 {
 	
@@ -334,6 +354,8 @@ int main( int argc , char** argv )
 
 	//std::cout << "6" << std::endl;
 
+	boost::thread_group tgroup;
+
 	for( unsigned int j = 0 ; j < filesize * 0.25 - BLOCK_SIZE * NUM_STREAMS  ; j += BLOCK_SIZE * NUM_STREAMS * BLOCKS_PER_STREAM )
 	{
 		int iteration_offset = j * sizeof( cufftReal );
@@ -343,25 +365,32 @@ int main( int argc , char** argv )
 
 			int stream_offset = k * BLOCK_SIZE * BLOCKS_PER_STREAM;
 
-			cudaMemcpyAsync( deviceSource + stream_offset  , original + iteration_offset + stream_offset , BLOCK_SIZE * BLOCKS_PER_STREAM , cudaMemcpyHostToDevice , streams[ k ] );
+			gpuErrchk( cudaMemcpyAsync( deviceSource + stream_offset  , original + iteration_offset + stream_offset , BLOCK_SIZE * BLOCKS_PER_STREAM , cudaMemcpyHostToDevice , streams[ k ] ) );
 
 			for( int l = 0 ; l < BLOCKS_PER_STREAM ; l++ )
 			{
 
 				int block_offset = l * BLOCK_SIZE;
 
-				fft_result = cufftExecR2C( plans[k] , deviceSource + stream_offset + block_offset , deviceResult + stream_offset + block_offset );
+				//std::async( std::launch::async, workerThread, plans , k , deviceSource , deviceResult, stream_offset , block_offset );
+
+				boost::thread* t = new boost::thread( workerThread , plans , k , deviceSource , deviceResult, stream_offset , block_offset );
+
+				tgroup.add_thread( t );
+
+				//workerThread( plans , k , deviceSource , deviceResult, stream_offset , block_offset );
+
+				/*cufftExecR2C( plans[k] , deviceSource + stream_offset + block_offset , deviceResult + stream_offset + block_offset );
 
 				if( fft_result != CUFFT_SUCCESS )
 
 					exit(2);
 
-				// num blocks * num threads = fftsize / 2 ... nyquist limit
-				scaleResult<<< 64 , 32 , 0 , streams[ k ] >>>( deviceScaledResult + stream_offset + block_offset , deviceResult + stream_offset + block_offset );
 
 				gpuErrchk( cudaPeekAtLastError() );
+				*/
 
-				findTransmissions<<< 64 , 32 , 0 , streams[ k ] >>>(
+				/*findTransmissions<<< 64 , 32 , 0 , streams[ k ] >>>(
 						deviceScaledResult + stream_offset + block_offset,
 						deviceBins,
 						deviceFrequencies,
@@ -373,12 +402,19 @@ int main( int argc , char** argv )
 
 				//std::cout << "11" << std::endl;
 
-				gpuErrchk( cudaPeekAtLastError() );
+				gpuErrchk( cudaPeekAtLastError() );*/
 
 			}
+
+			scaleResult<<< 256 , 128 , 0 , streams[ k ] >>>( deviceScaledResult , deviceResult );
+
 		}
 
 	}
+
+	cudaDeviceSynchronize();
+
+	tgroup.join_all();
 
 	//std::cout << "12" << std::endl;
 
@@ -413,6 +449,9 @@ int main( int argc , char** argv )
 
 	std::cout << *hostCount << std::endl;
 
+	cudaDeviceReset();
+
+	/*
 	std::ofstream fo;
 
 	fo.open( "spikes.txt" );
@@ -430,7 +469,7 @@ int main( int argc , char** argv )
 		fo << "Time end        : " << hostEnds[ i ] << " s\n";
 
 	}
-
+	*/
 	return 0;
 
 }
